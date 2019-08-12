@@ -268,6 +268,7 @@ class CollectorOfflineDataSync(object):
 
         finally:
             try:
+                logging.shutdown()
                 # arcpy.Delete_management(temp_gdb)
                 arcpy.Delete_management(temp_xml)
                 pass
