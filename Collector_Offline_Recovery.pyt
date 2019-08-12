@@ -64,15 +64,6 @@ import arcgis
 arcpy.env.addOutputsToMap = False
 arcpy.env.overwriteOutput = True
 
-# Configure the logger
-fname = os.path.splitext(__file__)[0]
-log_file ='{}.log'.format(fname)
-logging.basicConfig(
-    filename=log_file,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    )
-
 
 ###### Main Program: ######
 
@@ -171,6 +162,15 @@ class CollectorOfflineDataSync(object):
     def execute(self, params, messages):
 
         try:
+            # Configure the logger
+            fname = os.path.splitext(__file__)[0]
+            log_file ='{}.log'.format(fname)
+            logging.basicConfig(
+                filename=log_file,
+                format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                level=logging.INFO,
+                )
+
             offline_data_folder, organization_url, username, password, feature_server_url, debug_mode = params
 
             logging.info('Offline data folder: {}'.format(offline_data_folder.valueAsText))
@@ -267,9 +267,8 @@ class CollectorOfflineDataSync(object):
             logging.exception("An error occurred..")
 
         finally:
-            try:
-                logging.shutdown()
-                # arcpy.Delete_management(temp_gdb)
+            logging.shutdown()
+            try:    
                 arcpy.Delete_management(temp_xml)
                 pass
             except:
