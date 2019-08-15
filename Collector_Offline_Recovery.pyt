@@ -13,12 +13,19 @@ Date:
 Convert a runtime (Collector) geodatabase to a file geodatabase and sync with an
 existing hosted feature service.
 
+Will only add new data and updated existing data - will not delete service data - too dangerous..
+
+
+###### Requirements: ######
+
 MUST RUN IN ArcPRO!
+Feature Service layers must have 'GlobalID', and 'last_edited_date' in order to sync..
+
 
 ###### Parameters: ######
 
 Inputs:
-    * Path to input runtime geodatabase folder  [workspace]
+    * Path to input runtime geodatabase file    [file]
     * Organization URL                          [string]
     * Username                                  [string]
     * Password                                  [string hidden]
@@ -29,26 +36,21 @@ Outputs:
 
 
 ###### Process: ######
-
-01. Get paths to Collector offline data folder (copied from device) and output files
-02. Create xml workspace file in Collector offline data folder
-03. Create temp fgdb in Collector offline data folder
-04. Import xml to temp fgdb, capturing schema and data
-
-05. Connect to the GIS and get the hosted feature layers
-
-For each hosted feature layer:
-    06. Make feature layer (from corresponding feature class in temp_gdb)
-    07. Selet local layer by hosted layer intersection (get features not in service)
-    08. Append selected records to hosted feature layer
+Copy .geodatabase to XML
+Create file geodatabase and import XML data
+Connect to feature service and get layers
+For each layer, get the corresponding feature class from geodatabase
+Compare the global IDs and last_edit_dates to get adds (new globals) and updates (matching globals with more recent edits)
+Remove rows to be updated from service
+Add new features and updated features
+Profit.
+...
 
 
+###### TODO: ######
+* Tighten up the logging and error handling..
+* Figure out how to handle updates to attachments only (add/delete) - does not update last_edit_date
 
-#TODO: Sweep attributes for updates
-#TODO: Sweep for new photos
-#TODO: What about intersection of edited polygons?
-
-#TODO: Add SAML Auth handler
 
 """
 
@@ -63,6 +65,58 @@ import arcgis
 
 arcpy.env.addOutputsToMap = False
 arcpy.env.overwriteOutput = True
+
+
+###### Helpers: ######
+
+def deleteInMemory():
+    """
+    Delete in memory tables and feature classes.
+    Reset to original worksapce when done.
+    """
+    # get the original workspace location
+    orig_workspace = arcpy.env.workspace
+    # Set the workspace to in_memory
+    arcpy.env.workspace = "in_memory"
+    # Delete all in memory feature classes
+    for fc in arcpy.ListFeatureClasses():
+        arcpy.Delete_management(fc)
+    # Delete all in memory tables
+    for tbl in arcpy.ListTables():
+        arcpy.Delete_management(tbl)
+    # Reset the workspace
+    arcpy.env.workspace = orig_workspace
+
+
+def get_global_w_last_edit_date(fc):
+    """
+    returns a dictionary of globalID and last edit date for each 
+    feature in a feature class.
+
+    Assumes standard 'GlobalID', and 'last_edited_date' field names!
+    """ 
+    query_fields = ['GlobalID', 'last_edited_date']
+    try:
+        return {row[0]: row[1] for row in arcpy.da.SearchCursor(fc, query_fields)}
+    except:
+        raise Exception('Input feature class does not have GlobalID and last_edited_date fields - cannot sync..')
+
+
+def buildWhereClauseFromList(table, field, valueList):
+    """
+    Takes a list of values and constructs a SQL WHERE
+    clause to select those values within a given field and table.
+    """
+    # Add DBMS-specific field delimiters
+    fieldDelimited = arcpy.AddFieldDelimiters(arcpy.Describe(table).path, field)
+    # Determine field type
+    fieldType = arcpy.ListFields(table, field)[0].type
+    # Add single-quotes for string field values
+    if str(fieldType) in ('String', 'GlobalID'):
+        valueList = ["'%s'" % value for value in valueList]
+    # Format WHERE clause in the form of an IN statement
+    whereClause = "%s IN(%s)" % (fieldDelimited, ', '.join(map(str, valueList)))
+    return whereClause
 
 
 ###### Main Program: ######
@@ -82,10 +136,10 @@ class CollectorOfflineDataSync(object):
 
     def getParameterInfo(self):
 
-        offline_data_folder = arcpy.Parameter(
-            displayName="Offline Data Folder Location",
-            name="offline_data_folder",
-            datatype="DEFolder",
+        geodatabase_file = arcpy.Parameter(
+            displayName="Input .geodatabase file",
+            name="geodatabase_file",
+            datatype="DEFile",
             parameterType="Required",
             direction="Input",
             )
@@ -123,7 +177,7 @@ class CollectorOfflineDataSync(object):
             )
 
         debug_mode = arcpy.Parameter(
-            displayName="Debug Mode (sets logging level to DEBUG and outputs data without appending)",
+            displayName="Debug Mode (copies insert and update data without modifying service)",
             name="debug_mode",
             datatype="Boolean",
             parameterType="Optional",
@@ -131,7 +185,7 @@ class CollectorOfflineDataSync(object):
             )
 
         return [
-            offline_data_folder,
+            geodatabase_file,
             organization_url,
             username,
             password,
@@ -146,70 +200,61 @@ class CollectorOfflineDataSync(object):
         return
 
     def updateMessages(self, params):
-        offline_data_folder = params[0]
-        offline_files = os.listdir(offline_data_folder.valueAsText)
-        geodatabase_files = [f for f in offline_files if os.path.splitext(f)[1] == '.geodatabase']
-        if not geodatabase_files:
-            offline_data_folder.setErrorMessage(
-                'No .geodatabase file found in folder:\n{}'.format(offline_data_folder.valueAsText)
-            )
-        elif len(geodatabase_files) > 1:
-            offline_data_folder.setErrorMessage(
-                'Multiple .geodatabase files found in folder:\n{}\n'.format(offline_data_folder.valueAsText)
-            )
+        geodatabase_file = params[0]
+        if geodatabase_file.value:
+            if not os.path.splitext(geodatabase_file.valueAsText)[1].lower() == '.geodatabase':
+                geodatabase_file.setErrorMessage('{} is not a .geodatabase file..'.format(geodatabase_file.valueAsText))
         return
 
     def execute(self, params, messages):
 
         try:
+            deleteInMemory()
+
+            geodatabase_file, organization_url, username, password, feature_server_url, debug_mode = params
+            geodatabase_file = geodatabase_file.valueAsText
+
+            # Get the geodatabase file parent directory
+            parent_dir = os.path.dirname(geodatabase_file)
+            geodatabase_filename = os.path.basename(geodatabase_file)
+            geodatabase_name = os.path.splitext(geodatabase_filename)[0]
+
             # Configure the logger
-            fname = os.path.splitext(__file__)[0]
-            log_file ='{}.log'.format(fname)
+            log_file = os.path.join(parent_dir, '{}.log'.format(geodatabase_name))
             logging.basicConfig(
                 filename=log_file,
                 format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
                 level=logging.INFO,
                 )
 
-            offline_data_folder, organization_url, username, password, feature_server_url, debug_mode = params
+            # Brace yourself - AGOL services are DEBUG verbose!
+            # if debug_mode.value:
+            #     logging.getLogger().setLevel(logging.DEBUG)
 
-            logging.info('Offline data folder: {}'.format(offline_data_folder.valueAsText))
+            logging.info('Godatabase_file: {}'.format(geodatabase_file))
             logging.info('Organization URL: {}'.format(organization_url.valueAsText))
             logging.info('Username: {}'.format(username.valueAsText))
             logging.info('Feature service URL: {}'.format(feature_server_url.valueAsText))
             logging.info('Debug Mode: {}'.format(debug_mode.valueAsText))
 
-            if debug_mode.value:
-                logging.getLogger().setLevel(logging.DEBUG)
+            # Get output file paths
+            temp_gdb = os.path.join(parent_dir, '{}.gdb'.format(geodatabase_name))
+            temp_xml = os.path.join(parent_dir, '{}.xml'.format(geodatabase_name))
 
-
-########### Step 01. Get paths to Collector offline data folder (copied from device) and output files
-            offline_data_folder = offline_data_folder.valueAsText
-            offline_files = os.listdir(offline_data_folder)
-
-            geodatabase_file = os.path.join(
-                offline_data_folder,
-                [f for f in offline_files if os.path.splitext(f)[1] == '.geodatabase'][0]
-            )
-            logging.info('Geodatabase file: {}'.format(geodatabase_file))
-
-            temp_gdb = os.path.join(offline_data_folder, 'sync_temp.gdb')
-            temp_xml = os.path.join(offline_data_folder, 'sync_temp.xml')
-
-########### Step 02. Create xml workspace file in Collector offline data folder
+            # Create xml workspace file in geodatabase file directory
             arcpy.ExportXMLWorkspaceDocument_management(
                 in_data=geodatabase_file,
                 out_file=temp_xml,
                 export_type='DATA'
                 )
 
-########### Step 03. Create temp fgdb in Collector offline data folder
-            arcpy.CreateFileGDB_management(offline_data_folder, 'sync_temp.gdb')
+            # Create temp fgdb in geodatabase file directory
+            arcpy.CreateFileGDB_management(parent_dir, os.path.basename(temp_gdb))
 
-########### Step 04. Import xml to temp fgdb, capturing schema and data
+            # Import xml to temp fgdb, capturing schema and data
             arcpy.ImportXMLWorkspaceDocument_management(temp_gdb, temp_xml)
 
-########### Step 05. Connect to the GIS and get the hosted feature layers
+            # Connect to the GIS and get the hosted feature layers
             gis = arcgis.gis.GIS(
                 url=organization_url.valueAsText,
                 username=username.valueAsText,
@@ -220,58 +265,107 @@ class CollectorOfflineDataSync(object):
                 gis=gis,
                 )
 
-########### For each hosted feature layer/ feature class combo:
+            # For each hosted feature layer/ feature class combo:
             for feature_layer in feature_layers.layers:
-                feature_layer_name = feature_layer.properties.name
-                arcpy.AddMessage('Syncing: {}'.format(feature_layer_name))
-                logging.info('Syncing: {}'.format(feature_layer_name))
+                try:
+                    feature_layer_name = feature_layer.properties.name
+                    msg = 'Processing feature class: {}'.format(feature_layer_name)
+                    arcpy.AddMessage(msg); logging.info(msg)
 
-                # This is kind of convoluted, but it works. As far as I can tell, HFS have to be cast as an
-                # arcpy FeatureSet or arcpy FeatureLayer of a FeatureSet in order to be consumed by arcpy geoprocessing tools
-                feature_set = arcpy.FeatureSet(feature_layer.url)
-                feature_set_layer = arcpy.MakeFeatureLayer_management(feature_set, 'in_memory\\fl_tmp')
+                    # This is kind of convoluted, but it works. As far as I can tell, HFS have to be cast as an
+                    # arcpy FeatureSet or arcpy FeatureLayer of a FeatureSet in order to be consumed by arcpy geoprocessing tools
+                    feature_set = arcpy.FeatureSet(feature_layer.url)
+                    feature_service_layer = arcpy.MakeFeatureLayer_management(feature_set, 'in_memory\\feature_service_tmp')
 
-                ### Step 06. Make feature layer (from corresponding feature class in temp_gdb)
-                fc_path = os.path.join(temp_gdb, feature_layer_name)
-                if not arcpy.Exists(fc_path):
-                    errMsg = 'Source features not found:\n{}\nDid you reference the correct feature service?'.format(fc_path)
-                    arcpy.AddError(errMsg)
-                    logging.info(errMsg)
-                fc_layer = arcpy.MakeFeatureLayer_management(fc_path, 'in_memory\\fc_tmp')
+                    # Make feature layer (from corresponding feature class in temp_gdb)
+                    feature_class_path = os.path.join(temp_gdb, feature_layer_name)
+                    if not arcpy.Exists(feature_class_path):
+                        errMsg = 'Source features not found:\n{}\nDid you reference the correct feature service?'.format(feature_class_path)
+                        arcpy.AddError(errMsg); logging.info(errMsg)
+                    feature_class_layer = arcpy.MakeFeatureLayer_management(feature_class_path, 'in_memory\\feature_class_tmp')
 
-                ### Step 07. Select local layer by hosted layer intersection (get features not in service)
-                arcpy.SelectLayerByLocation_management(
-                    in_layer=fc_layer,
-                    overlap_type='INTERSECT',
-                    select_features=feature_set_layer,
-                    search_distance='2 METERS',  # To account for differences in projections, this is risky business
-                    selection_type="NEW_SELECTION",
-                    invert_spatial_relationship="INVERT"
-                    )
+                    # Get the GlobalIDs and last edit dates
+                    feature_service_globals = get_global_w_last_edit_date(feature_service_layer)
+                    feature_class_globals = get_global_w_last_edit_date(feature_class_layer)
 
-                ### Step 08. Append selected records to hosted feature layer
-                # If no selection, skip
-                selections = arcpy.Describe(fc_layer).FIDSet
-                if selections:
-                    new_data = '{}_updates'.format(feature_layer_name)
-                    if debug_mode.value:
-                        arcpy.CopyFeatures_management(fc_layer, os.path.join(temp_gdb, new_data))
-                    else:
-                        arcpy.Append_management(fc_layer, feature_set_layer, 'NO_TEST')  # Sometimes TEST is too picky (order)
-                else:
-                    arcpy.AddMessage('{} is current..'.format(feature_layer_name))
-                    logging.info('{} is current..'.format(feature_layer_name))
+                    # Converting to and from XML uppers the GlobalIDs! Why XML, WHY??
+                    # That requires that we add a case translation mechanism before making compaisons and attribute selections..
+                    fsg_translator = {fsg.lower(): fsg  for fsg in feature_service_globals}
+
+                    # INSERTS: These globalIDs are new and need to be added to service
+                    inserts = []  # this will hold the new feature class globals in original case
+                    for feature_class_global in feature_class_globals:
+                        if feature_class_global.lower() not in set(fsg_translator):  # keys - lowercase comparison
+                            inserts.append(feature_class_global)  # Append original case
+
+                    # Remove inserts from feature_class_globals so we don't waste time checking if an update
+                    for insert in inserts:
+                        feature_class_globals.pop(insert)
+                    logging.info('Inserts: {}'.format(', '.join(inserts)))
+
+                    # UPDATES: These need to be removed from service and re-inserted
+                    updates = []  # this will hold the update feature class globals in original case
+                    for feature_class_global, last_edit_date in feature_class_globals.items():
+                        # Datetimes - the past is < the present
+                        # If Collector edit dates are more recent that service edit dates:
+                        # Use lowercase fcg to get correct fsg case
+                        if last_edit_date > feature_service_globals[fsg_translator[feature_class_global.lower()]]:
+                            updates.append(feature_class_global)  # append original version
+                    logging.info('Updates: {}'.format(', '.join(updates)))
+
+                    # Delete the rows that need to be updated
+                    if updates:
+                        # Copy the update data
+                        update_data = '{}_update'.format(feature_layer_name)
+                        update_where = buildWhereClauseFromList(feature_class_layer, 'GlobalID', updates)
+                        arcpy.SelectLayerByAttribute_management(feature_class_layer, where_clause=update_where)
+                        arcpy.CopyFeatures_management(feature_class_layer, os.path.join(temp_gdb, update_data))
+                        # Delete the records from the feature service that need updated
+                        # Translate the fcg update to correct case fsg
+                        fsg_updates = [fsg_translator[update.lower()] for update in updates]
+                        delete_where = buildWhereClauseFromList(feature_service_layer, 'GlobalID', fsg_updates)
+                        arcpy.SelectLayerByAttribute_management(feature_service_layer, where_clause=delete_where)
+                        if debug_mode.value:
+                            # Do nothing!
+                            pass
+                        else:
+                            arcpy.DeleteRows_management(feature_service_layer)
+
+                    # Add the new features (new records and updates)
+                    if inserts:
+                        # Copy the insert data
+                        insert_data = '{}_inserts'.format(feature_layer_name)
+                        insert_where = buildWhereClauseFromList(feature_class_layer, 'GlobalID', inserts)
+                        arcpy.SelectLayerByAttribute_management(feature_class_layer, where_clause=insert_where)
+                        arcpy.CopyFeatures_management(feature_class_layer, os.path.join(temp_gdb, insert_data))
+                        # New selection with inserts AND updates
+                        insert_update_where = buildWhereClauseFromList(feature_class_layer, 'GlobalID', inserts + updates)
+                        arcpy.SelectLayerByAttribute_management(feature_class_layer, where_clause=insert_update_where)
+                        # Append selected records to hosted feature layer
+                        if debug_mode.value:
+                            msg = 'Debug Mode - Copying data only: {}'.format(feature_layer_name)
+                            arcpy.AddMessage(msg); logging.info(msg)
+                        else:
+                            msg = 'Update Mode - Updating service data: {}'.format(feature_layer_name)
+                            arcpy.AddMessage(msg); logging.info(msg)
+                            arcpy.Append_management(feature_class_layer, feature_service_layer, 'NO_TEST')
+
+                except:
+                    logging.exception("Could not update {}..".format(feature_layer_name))
 
         except:
             arcpy.AddError(traceback.format_exc())
             logging.exception("An error occurred..")
 
         finally:
-            logging.shutdown()
-            try:    
-                arcpy.Delete_management(temp_xml)
-                pass
-            except:
-                pass  # These may not delete
+            # Shut down the logger
+            logger = logging.getLogger()
+            handlers = logger.handlers[:]
+            for handler in handlers:
+                handler.close()
+                logger.removeHandler(handler)
+
+            arcpy.Delete_management(temp_xml)
+            deleteInMemory()
 
         return
