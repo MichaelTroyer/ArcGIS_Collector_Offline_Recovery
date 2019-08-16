@@ -48,9 +48,7 @@ Profit.
 
 
 ###### TODO: ######
-* Tighten up the logging and error handling..
 * Figure out how to handle updates to attachments only (add/delete) - does not update last_edit_date
-
 
 """
 
@@ -65,6 +63,8 @@ import arcgis
 
 arcpy.env.addOutputsToMap = False
 arcpy.env.overwriteOutput = True
+# Only works for Enterprise data.. Not sure if works for feature services at all..
+arcpy.env.preserveGlobalIds = True
 
 
 ###### Helpers: ######
@@ -227,15 +227,21 @@ class CollectorOfflineDataSync(object):
                 level=logging.INFO,
                 )
 
-            # Brace yourself - AGOL services are DEBUG verbose!
-            # if debug_mode.value:
-            #     logging.getLogger().setLevel(logging.DEBUG)
+            def log_message(msg):
+                arcpy.AddMessage(msg); logging.info(msg)
 
             logging.info('Godatabase_file: {}'.format(geodatabase_file))
             logging.info('Organization URL: {}'.format(organization_url.valueAsText))
             logging.info('Username: {}'.format(username.valueAsText))
             logging.info('Feature service URL: {}'.format(feature_server_url.valueAsText))
             logging.info('Debug Mode: {}'.format(debug_mode.valueAsText))
+
+            if debug_mode.value:
+                logging.getLogger().setLevel(logging.DEBUG)
+                msg = 'Debug Mode - Copying data only..'
+            else:
+                msg = 'Update Mode - Updating service layers..'
+            log_message(msg)
 
             # Get output file paths
             temp_gdb = os.path.join(parent_dir, '{}.gdb'.format(geodatabase_name))
@@ -270,7 +276,7 @@ class CollectorOfflineDataSync(object):
                 try:
                     feature_layer_name = feature_layer.properties.name
                     msg = 'Processing feature class: {}'.format(feature_layer_name)
-                    arcpy.AddMessage(msg); logging.info(msg)
+                    log_message(msg)
 
                     # This is kind of convoluted, but it works. As far as I can tell, HFS have to be cast as an
                     # arcpy FeatureSet or arcpy FeatureLayer of a FeatureSet in order to be consumed by arcpy geoprocessing tools
@@ -281,7 +287,7 @@ class CollectorOfflineDataSync(object):
                     feature_class_path = os.path.join(temp_gdb, feature_layer_name)
                     if not arcpy.Exists(feature_class_path):
                         errMsg = 'Source features not found:\n{}\nDid you reference the correct feature service?'.format(feature_class_path)
-                        arcpy.AddError(errMsg); logging.info(errMsg)
+                        log_message(errMsg)
                     feature_class_layer = arcpy.MakeFeatureLayer_management(feature_class_path, 'in_memory\\feature_class_tmp')
 
                     # Get the GlobalIDs and last edit dates
@@ -301,7 +307,33 @@ class CollectorOfflineDataSync(object):
                     # Remove inserts from feature_class_globals so we don't waste time checking if an update
                     for insert in inserts:
                         feature_class_globals.pop(insert)
-                    logging.info('Inserts: {}'.format(', '.join(inserts)))
+
+                    # Add the new features
+                    if inserts:
+                        insert_where = buildWhereClauseFromList(feature_class_layer, 'GlobalID', inserts)
+                        arcpy.SelectLayerByAttribute_management(feature_class_layer, where_clause=insert_where)
+                        # Filter out identical geometries from existing selection.
+                        # This guards against redundant offline syncs - globals change once appended to service, 
+                        # so redundant use of the tool with the same source data will flag previously synced
+                        # source globals as new when rerun - unless filtered out using identical geometry.
+                        arcpy.management.SelectLayerByLocation(
+                            feature_class_layer,
+                            "ARE_IDENTICAL_TO",
+                            feature_service_layer,
+                            selection_type='REMOVE_FROM_SELECTION',
+                            )
+                        selected_inserts = arcpy.Describe(feature_class_layer).FIDSet  # ';' delimited string.. 
+                        if selected_inserts:
+                            msg = '{} Insert(s)..'.format(len(selected_inserts.split(';')))
+                            insert_data = '{}_inserts'.format(feature_layer_name)
+                            arcpy.CopyFeatures_management(feature_class_layer, os.path.join(temp_gdb, insert_data))
+                            # Append the new records
+                            if not debug_mode.value:
+                                arcpy.Append_management(feature_class_layer, feature_service_layer, 'NO_TEST')
+                        else:
+                            msg = '0 Insert(s)..'
+                        log_message(msg)
+
 
                     # UPDATES: These need to be removed from service and re-inserted
                     updates = []  # this will hold the update feature class globals in original case
@@ -311,12 +343,13 @@ class CollectorOfflineDataSync(object):
                         # Use lowercase fcg to get correct fsg case
                         if last_edit_date > feature_service_globals[fsg_translator[feature_class_global.lower()]]:
                             updates.append(feature_class_global)  # append original version
-                    logging.info('Updates: {}'.format(', '.join(updates)))
+                    msg = '{} Update(s)..'.format(len(updates))
+                    log_message(msg)
 
                     # Delete the rows that need to be updated
                     if updates:
                         # Copy the update data
-                        update_data = '{}_update'.format(feature_layer_name)
+                        update_data = '{}_updates'.format(feature_layer_name)
                         update_where = buildWhereClauseFromList(feature_class_layer, 'GlobalID', updates)
                         arcpy.SelectLayerByAttribute_management(feature_class_layer, where_clause=update_where)
                         arcpy.CopyFeatures_management(feature_class_layer, os.path.join(temp_gdb, update_data))
@@ -325,33 +358,15 @@ class CollectorOfflineDataSync(object):
                         fsg_updates = [fsg_translator[update.lower()] for update in updates]
                         delete_where = buildWhereClauseFromList(feature_service_layer, 'GlobalID', fsg_updates)
                         arcpy.SelectLayerByAttribute_management(feature_service_layer, where_clause=delete_where)
-                        if debug_mode.value:
-                            # Do nothing!
-                            pass
-                        else:
+                        if not debug_mode.value:
+                            # Remove the old data and add the new data
                             arcpy.DeleteRows_management(feature_service_layer)
-
-                    # Add the new features (new records and updates)
-                    if inserts:
-                        # Copy the insert data
-                        insert_data = '{}_inserts'.format(feature_layer_name)
-                        insert_where = buildWhereClauseFromList(feature_class_layer, 'GlobalID', inserts)
-                        arcpy.SelectLayerByAttribute_management(feature_class_layer, where_clause=insert_where)
-                        arcpy.CopyFeatures_management(feature_class_layer, os.path.join(temp_gdb, insert_data))
-                        # New selection with inserts AND updates
-                        insert_update_where = buildWhereClauseFromList(feature_class_layer, 'GlobalID', inserts + updates)
-                        arcpy.SelectLayerByAttribute_management(feature_class_layer, where_clause=insert_update_where)
-                        # Append selected records to hosted feature layer
-                        if debug_mode.value:
-                            msg = 'Debug Mode - Copying data only: {}'.format(feature_layer_name)
-                            arcpy.AddMessage(msg); logging.info(msg)
-                        else:
-                            msg = 'Update Mode - Updating service data: {}'.format(feature_layer_name)
-                            arcpy.AddMessage(msg); logging.info(msg)
                             arcpy.Append_management(feature_class_layer, feature_service_layer, 'NO_TEST')
 
                 except:
                     logging.exception("Could not update {}..".format(feature_layer_name))
+
+            log_message('Successful completion..')
 
         except:
             arcpy.AddError(traceback.format_exc())
